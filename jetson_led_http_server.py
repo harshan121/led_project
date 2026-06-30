@@ -1,4 +1,6 @@
 import json
+import time
+import threading
 import urllib.parse
 from http.server import BaseHTTPRequestHandler
 from socketserver import ThreadingTCPServer
@@ -38,6 +40,10 @@ CYAN = [0, 255, 255]
 
 LAST_STATE = "none"
 
+animation_stop_event = threading.Event()
+animation_thread = None
+animation_lock = threading.Lock()
+
 
 def make_url(host, endpoint):
     return f"http://{host}{endpoint}"
@@ -54,7 +60,6 @@ def send_state(controller_name, payload):
         )
         response.raise_for_status()
         return controller_name, True, response.text
-
     except Exception as error:
         return controller_name, False, str(error)
 
@@ -66,7 +71,6 @@ def get_info(controller_name):
         response = requests.get(make_url(host, "/json/info"), timeout=TIMEOUT)
         response.raise_for_status()
         return controller_name, True, response.json()
-
     except Exception as error:
         return controller_name, False, str(error)
 
@@ -206,6 +210,87 @@ def four_strip_colors(strip_1, strip_2, strip_3, strip_4, fx=FX_SOLID, speed=128
     return send_parallel(payloads, command_name)
 
 
+def stop_animation():
+    global animation_thread
+
+    with animation_lock:
+        animation_stop_event.set()
+
+        if animation_thread is not None and animation_thread.is_alive():
+            animation_thread.join(timeout=2)
+
+        animation_thread = None
+        animation_stop_event.clear()
+
+
+def start_animation(animation_function):
+    global animation_thread
+
+    stop_animation()
+
+    animation_thread = threading.Thread(
+        target=animation_function,
+        daemon=True,
+    )
+    animation_thread.start()
+
+
+def moving_right_loop():
+    print("Starting continuous moving_right animation", flush=True)
+
+    pattern = [
+        [BLUE, BLACK, BLACK, BLACK],
+        [BLACK, BLUE, BLACK, BLACK],
+        [BLACK, BLACK, BLUE, BLACK],
+        [BLACK, BLACK, BLACK, BLUE],
+    ]
+
+    while not animation_stop_event.is_set():
+        for step in pattern:
+            if animation_stop_event.is_set():
+                break
+
+            four_strip_colors(
+                step[0],
+                step[1],
+                step[2],
+                step[3],
+                fx=FX_SOLID,
+                command_name="moving_right step",
+            )
+            time.sleep(0.45)
+
+    print("Stopped moving_right animation", flush=True)
+
+
+def moving_left_loop():
+    print("Starting continuous moving_left animation", flush=True)
+
+    pattern = [
+        [BLACK, BLACK, BLACK, PURPLE],
+        [BLACK, BLACK, PURPLE, BLACK],
+        [BLACK, PURPLE, BLACK, BLACK],
+        [PURPLE, BLACK, BLACK, BLACK],
+    ]
+
+    while not animation_stop_event.is_set():
+        for step in pattern:
+            if animation_stop_event.is_set():
+                break
+
+            four_strip_colors(
+                step[0],
+                step[1],
+                step[2],
+                step[3],
+                fx=FX_SOLID,
+                command_name="moving_left step",
+            )
+            time.sleep(0.45)
+
+    print("Stopped moving_left animation", flush=True)
+
+
 def test_connections():
     all_ok = True
 
@@ -246,29 +331,12 @@ def robot_alarm():
     return all_same(RED, FX_BLINK, speed=190, intensity=255, command_name="alarm")
 
 
-def robot_moving_right():
-    return four_strip_colors(
-        BLUE, BLUE, BLUE, BLUE,
-        fx=FX_CHASE,
-        speed=180,
-        intensity=180,
-        command_name="moving_right continuous chase",
-    )
-
-
-def robot_moving_left():
-    return four_strip_colors(
-        PURPLE, PURPLE, PURPLE, PURPLE,
-        fx=FX_CHASE,
-        speed=80,
-        intensity=180,
-        command_name="moving_left continuous chase",
-    )
-
-
 def robot_turn_left():
     return four_strip_colors(
-        YELLOW, YELLOW, BLACK, BLACK,
+        YELLOW,
+        YELLOW,
+        BLACK,
+        BLACK,
         fx=FX_BLINK,
         speed=160,
         intensity=255,
@@ -278,7 +346,10 @@ def robot_turn_left():
 
 def robot_turn_right():
     return four_strip_colors(
-        BLACK, BLACK, YELLOW, YELLOW,
+        BLACK,
+        BLACK,
+        YELLOW,
+        YELLOW,
         fx=FX_BLINK,
         speed=160,
         intensity=255,
@@ -296,7 +367,10 @@ def robot_success():
 
 def robot_warning():
     return four_strip_colors(
-        ORANGE, BLACK, ORANGE, BLACK,
+        ORANGE,
+        BLACK,
+        ORANGE,
+        BLACK,
         fx=FX_BLINK,
         speed=150,
         intensity=255,
@@ -320,14 +394,24 @@ def pattern_scan():
     return all_same(WHITE, FX_SCAN, speed=160, intensity=180, command_name="scan")
 
 
+def command_moving_right():
+    start_animation(moving_right_loop)
+    return True
+
+
+def command_moving_left():
+    start_animation(moving_left_loop)
+    return True
+
+
 STATE_FUNCTIONS = {
     "startup": robot_startup,
     "idle": robot_idle,
     "serving": robot_serving,
     "human_near": robot_human_near,
     "alarm": robot_alarm,
-    "moving_right": robot_moving_right,
-    "moving_left": robot_moving_left,
+    "moving_right": command_moving_right,
+    "moving_left": command_moving_left,
     "turn_left": robot_turn_left,
     "turn_right": robot_turn_right,
     "processing": robot_processing,
@@ -352,10 +436,24 @@ def run_state(state_name):
 
     print(f"\nNew command received: {state_name}", flush=True)
 
-    if state_name not in ["off", "reset", "test_connections"]:
-        reset_both()
+    if state_name in ["reset", "off", "test_connections"]:
+        stop_animation()
 
-    success = STATE_FUNCTIONS[state_name]()
+        if state_name == "reset":
+            success = reset_both()
+        elif state_name == "off":
+            success = all_off()
+        else:
+            success = test_connections()
+
+    elif state_name in ["moving_right", "moving_left"]:
+        reset_both()
+        success = STATE_FUNCTIONS[state_name]()
+
+    else:
+        stop_animation()
+        reset_both()
+        success = STATE_FUNCTIONS[state_name]()
 
     if success:
         LAST_STATE = state_name
@@ -499,6 +597,7 @@ def main():
     print("  http://192.168.0.214:5000/status", flush=True)
     print("  http://192.168.0.214:5000/states", flush=True)
     print("  http://192.168.0.214:5000/state/moving_right", flush=True)
+    print("  http://192.168.0.214:5000/state/moving_left", flush=True)
     print("  http://192.168.0.214:5000/reset", flush=True)
     print("  http://192.168.0.214:5000/off", flush=True)
 
@@ -511,6 +610,7 @@ def main():
 
     except KeyboardInterrupt:
         print("\nServer stopped. Turning LEDs off...", flush=True)
+        stop_animation()
         all_off()
 
 
